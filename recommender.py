@@ -6,6 +6,7 @@ Replaced hardcoded CHAMPIONS with ChampionData (Data Dragon + OP.GG).
 import logging
 
 from champion_data import get_champion_data
+from lane_detector import get_lane_rates
 
 logger = logging.getLogger(__name__)
 cd = get_champion_data()
@@ -76,6 +77,17 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
         if ckey in used:
             continue
 
+        # Hard filter: when position is specified, only consider champions
+        # with >= 5% play rate in that lane (data-driven via OP.GG lane dist)
+        lane_rate = 0.0
+        if my_position:
+            mapped = POSITION_MAP.get(my_position.lower(), "")
+            if mapped:
+                lane_rates = dict(get_lane_rates(ckey))
+                lane_rate = lane_rates.get(mapped, 0)
+                if lane_rate < 5.0:
+                    continue
+
         score = 0.0
         reasons = []
         meta = cd.get_meta(ckey)
@@ -97,16 +109,17 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
         if rank_mod["apply_diff_penalty"] and ckey in HIGH_DIFFICULTY:
             score -= 8
 
-        # 2. Position match (heavily weighted to prefer on-role picks)
+        # 2. Position match (lane-distribution-aware: flex picks with
+        # real off-role presence are recognized as valid for that lane)
         position_match = False
-        if my_position:
-            mapped = POSITION_MAP.get(my_position.lower(), "")
-            if mapped and role == mapped:
+        if my_position and mapped:
+            if lane_rate >= 15.0:
                 score += 45
                 position_match = True
-            elif mapped:
-                # Off-role penalty: only overcome by strong counter/synergy
-                score -= 12
+            elif lane_rate >= 5.0:
+                score += 20
+                position_match = True
+            # lane_rate < 5.0 already filtered out above
 
         # 3. Counter / countered
         counter_score = 0; countered_score = 0
@@ -229,13 +242,18 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
 
     scored.sort(key=lambda x: (-x["score"], -x["winrate"]))
 
-    # Position coverage: ensure all 5 roles have at least 1 recommendation
+    # Position coverage: when filtering by a specific lane, only ensure that
+    # lane has at least one pick (don't inject off-lane champions).
+    # When showing all positions, ensure all 5 roles are covered.
     POSITIONS = ["top", "jungle", "mid", "bot", "support"]
     result = scored[:top_n]
     covered = {r["role"] for r in result}
-    missing = [p for p in POSITIONS if p not in covered]
-    if my_position and my_position in missing:
-        missing.remove(my_position); missing.insert(0, my_position)
+
+    if my_position:
+        mapped = POSITION_MAP.get(my_position.lower(), "")
+        missing = [mapped] if mapped and mapped not in covered else []
+    else:
+        missing = [p for p in POSITIONS if p not in covered]
 
     # Pre-cache role filters to avoid repeated calls
     role_champs = {pos: cd.filter_by_role(pos) for pos in missing}

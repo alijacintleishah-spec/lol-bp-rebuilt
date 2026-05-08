@@ -1,0 +1,160 @@
+# LoL BP Assistant — 开发日志
+
+## 2026-05-08 腾讯101数据集成 + 段位/模式感知 + T0 + 动作节流 + 分路优化
+
+### 1. 腾讯 101.qq.com 数据集成
+- **新建**: `tencent_fetcher.py` — 从 game.gtimg.cn CDN 抓取符文/技能/英雄详情
+- **数据源**: `rune_list.js` (107符文) + `summonerskill_list.js` (10技能) + `champDetail_{id}.js` (英雄×分路详情含胜率/选取率)
+- **整合**: `lolalytics_scraper.py` 的 `get_runes()`/`get_spells()` 优先使用腾讯数据，回退到分路默认值
+- **效果**: 亚索中单→致命节奏(81.7%)，火男辅助→奥术彗星(30.1%)，不再是死板的"中路=电刑、辅助=余震"
+
+### 2. LCU 段位 & 游戏模式检测
+- **段位获取**: `lcu.py` 新增 `fetch_summoner_ranks()` — 从 LCU API 获取单双排/灵活组排段位
+- **模式检测**: `lcu.py` 新增 `_fetch_queue_info()` — 从 lobby/gameflow 获取队列类型
+- **后台刷新**: 段位/模式数据在 `poll_lcu` 主循环中自动获取，不阻塞推荐输出
+- **显示**: 进入英雄选择时显示 `段位: 单双:铂金 IV  灵活:翡翠 I  |  模式: 单双排位`
+
+### 3. 数据源状态卡片
+- **新增**: `_print_data_status()` — 进入英雄选择时显示一次完整数据源状态
+- **内容**: LCU 连接状态、段位、模式、推荐策略（段位自适应）、Meta/符文/技能/对位/分路各数据来源
+- **机制**: `_status_card_shown` flag + `_cs_restart` 信号 → 每次新对局显示一次，后续不刷新
+
+### 4. T0 级英雄识别
+- **新增**: `_get_effective_tier()` — S级 + WR≥52% + (PR≥8% 或 BR≥8%) → T0
+- **加成**: T0 +42 分 (vs S +30)，标签 "T0级" (vs "S级威胁")
+- **效果**: 当前版本识别出 9 个 T0 英雄（亚索、凯隐、船长、贾克斯、金克丝等）
+
+### 5. 动作变化节流 (修复首选用后卡死)
+- **根因**: `MIN_REC_INTERVAL` 2秒全局节流不区分动作变化，自己选完后 1-2 秒内敌方行动被挡住
+- **修复**: 新增 `_action_key()` — 追踪动作变化。动作变化→立即展示；相同动作→2秒节流
+- **影响文件**: `lcu_runner.py`
+
+### 6. 分路推荐权重优化
+- **修复**: 位置匹配加成 25→45，新增非对位惩罚 -12，位置空缺加成 8→15
+- **效果**: 五个分路推荐完全差异化（上路全是上单、中路全是中单…不再重复）
+
+### 7. 最终总结后抑制输出
+- **修复**: `all_picks_done` 后显示最终总结 → `return`，不再继续执行推荐逻辑
+- **额外**: `_final_summary_shown` 后且 `all_picks_done` 时直接 return，完全静默
+
+### 8. 敌方分路检测改进
+- **修复**: `lane_detector.py` 的 `get_lane_rates()` 从 100%单位置改为多源混合
+- **数据源**: Data Dragon 标签概率 + OP.GG 元数据 (7:3) + 30+ 摇摆英雄硬编码 + 最低 3% 保底
+- **效果**: 亚索 52%中/36%上，艾克 55%野/37%中
+
+### 9. Bug 修复汇总
+- `parse_session()` actions=None 崩溃 → 安全遍历
+- 四路胜率预测中 bot+support 合并为下路 2v2
+- 中路缺失：部分数据时不隐藏整行，改为"数据不足"
+- `_apply_session()` 解析失败时仍设置 `in_champ_select=True`
+- `_cs_restart` 信号在 WebSocket + REST 退出时均设置
+
+### 修改文件清单
+
+| 文件 | 改动类型 |
+|------|---------|
+| `tencent_fetcher.py` | **新建** — 腾讯 101 CDN 数据抓取 |
+| `lcu.py` | 段位/模式检测、退出信号、安全解析、`_apply_session` 容错 |
+| `lcu_runner.py` | 状态卡片、动作节流、T0、段位显示、最终总结抑制 |
+| `recommender.py` | T0 识别、段位权重修正、分路匹配增强 |
+| `engine.py` | T0 in ban推荐、4 路胜率预测、部分数据保留 |
+| `lane_detector.py` | 标签概率 + OP.GG + 摇摆英雄多源分路 |
+| `lolalytics_scraper.py` | 优先使用腾讯 101 数据 |
+| `CHANGELOG.txt` | 本日志 |
+
+## 2026-05-07 双选识别 + 下路组合优化 + 四路胜率
+
+### 1. 双位置同时选人识别
+- **根因**: `parse_session()` 只返回第一个未完成的 action，duo pick 时第二个位置被忽略
+- **修复 A**: `lcu.py` — `next_action` → `next_actions`（列表），遍历 active sub-array 获取所有未完成 action
+- **修复 B**: `lcu_runner.py` — `_on_session()` 按 self/teammate 分类处理多个 action，自己选人+队友同时选时分别显示推荐
+- **影响文件**: `lcu.py`, `lcu_runner.py`
+
+### 2. ADC/辅助推荐优先考虑下路组合
+- **修复**: `recommender.py` — 新增第7维度「下路组合」，仅对 bot/support 位置生效：
+  - 与已选 counterpart 的协同加成（组合名显示在 reasons）
+  - 对敌方 bot+support 双人的综合 counter 评分
+  - ADC 额外：基于阵容分析的 composition fit 加成
+- **影响文件**: `recommender.py`
+
+### 3. 胜率预测四路制 + 对线/对局分离
+- **修复 A**: `engine.py` — `predict_matchups()` 将 bot+support 合并为 "bottom" 2v2 预测
+  - 2v2 计算 4 组个体 matchup + bot synergy 加成
+  - 返回 `lane_winrate`（对线胜率）和 `game_winrate`（对局胜率=对线WR+阵容修正±5%）
+  - LANE_INFLUENCE 更新为 4 路权重
+- **修复 B**: `lcu_runner.py` — `_show_final_summary()` 显示四路对线和阵容分析
+- **影响文件**: `engine.py`, `lcu_runner.py`
+
+## 2026-05-06 后端修复 & GUI 计划
+
+### 本轮修复的问题
+
+#### 1. Ban 推荐只显示 6 个，大部分是上单
+- **根因**: `build_ban_recommendations()` 全局取 top_n=6，没有按分路区分
+- **修复**: `engine.py` — 改为按五个分路分别评分取 top 5，返回 `{"top": [...], "jungle": [...], "mid": [...], "bot": [...], "support": [...]}`
+- **影响文件**: `engine.py`, `lcu_runner.py`, `cli.py`
+
+#### 2. 对位胜率预测只能看到上路和打野
+- **根因**: LCU API 返回位置 `"bottom"`(ADC) 和 `"utility"`(辅助)，但代码用 `"bot"` 和 `"support"`
+- **修复 A**: `lcu.py` — 新增 `_norm_pos()` 归一化函数，所有位置提取处统一转换
+- **修复 B**: `lane_detector.py` — `get_lane_rates()` 给空缺分路补 5% 保底权重，确保 5 个分路都能分配到
+
+#### 3. 选英雄时不会推荐当前分路英雄
+- **根因**: `_norm_pos()` 归一化后 `"bottom"→"bot"`，但 `recommender.py` 的 `POSITION_MAP` 缺少 `"bot":"bot"` 映射；且位置匹配加成(+15)太低
+- **修复**: `recommender.py` — `POSITION_MAP` 加 `"bot":"bot"`；位置加成 15→25
+
+#### 4. 最终总结显示太慢
+- **根因**: `MIN_REC_INTERVAL`(2s) 在 `all_picks_done` 判断之前，最后一选可能被延迟
+- **修复**: `lcu_runner.py` — `all_picks_done` 且首次展示时跳过 MIN_REC_INTERVAL
+
+#### 5. 符文/召唤师技能显示英文
+- **修复**: `lolalytics_scraper.py` — 所有符文名、天赋树名、召唤师技能名、默认值全部改为中文
+
+#### 6. 符文展示不够详细
+- **修复**: `lcu_runner.py` — `_format_rune()` 增加副系显示，格式: `征服者 精密/坚决`
+
+### 修改文件清单
+
+| 文件 | 改动类型 |
+|---|---|
+| `engine.py` | Ban 推荐改为分路 dict |
+| `lcu.py` | 新增 _norm_pos() 位置归一化 |
+| `lane_detector.py` | 分路保底权重 5% |
+| `recommender.py` | POSITION_MAP 修复 + 位置加成提升 |
+| `lolalytics_scraper.py` | 全部英→中翻译 |
+| `lcu_runner.py` | Ban 分路显示、最终总结立即出、符文副系显示 |
+| `cli.py` | Ban 分路显示 |
+| `GUI-plan.txt` | 新建 — GUI 实现计划 |
+
+### 项目结构
+
+```
+lol-bp-rebuilt/
+├── champion_data.py          # Data Dragon 数据层 (172英雄)
+├── meta_fetcher.py           # OP.GG 实时数据
+├── recommender.py            # 7维推荐引擎
+├── engine.py                 # Ban推荐 + 阵容分析 + 符文/技能 + 对位预测
+├── lane_detector.py          # 敌方分路推测 (贪婪算法)
+├── lolalytics_scraper.py     # Rune/Spell/Matchup 数据 (含中文默认值)
+├── lcu.py                    # LCU API 连接 (WebSocket + REST)
+├── lcu_runner.py             # 自动模式入口 (控制台)
+├── cli.py                    # 手动模式入口 (命令行)
+├── build_exe.py              # PyInstaller 打包脚本
+├── BP.ico                    # 应用图标
+├── GUI-plan.txt              # GUI 实现计划
+└── data/
+    ├── champion_data.json         # Data Dragon 缓存 (zh_CN)
+    ├── champion_meta_live.json    # OP.GG meta 缓存
+    ├── champion_archetypes.json   # 原型标签 (170+英雄)
+    ├── archetypes.json            # 原型标签 + 协同规则
+    ├── lane_distribution.json     # 分路出场率
+    ├── runes.json                 # 符文缓存 (可能空)
+    ├── summoner_spells.json       # 技能缓存 (可能空)
+    └── matchups.json              # 对位缓存 (可能空)
+```
+
+### 已知待办
+
+- [ ] 创建 `desktop_app.py` GUI 应用 (计划见 GUI-plan.txt)
+- [ ] 修改 `build_exe.py` 添加 hidden-import
+- [ ] 打包测试

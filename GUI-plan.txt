@@ -1,0 +1,113 @@
+# LoL BP Assistant — GUI Implementation Plan
+
+## Context
+
+项目目前只有后端和命令行界面（`cli.py` 手动模式、`lcu_runner.py` 自动模式）。`build_exe.py` 已经引用了 `desktop_app.py` 作为 PyInstaller 入口（`--windowed --noconsole`），但该文件不存在。需要创建一个完整的桌面 GUI，支持自动模式（连接 LCU 实时显示）和手动模式（手动输入阵容获取推荐）。
+
+## Technology Choice: tkinter + ttk
+
+- Python 内置，零额外依赖，PyInstaller 打包最简单
+- `clam` 主题 + 深色配色方案（匹配 League 客户端风格）
+- 字体：微软雅黑（Windows 10/11 自带）
+
+## File to Create/Modify
+
+| File | Action |
+|---|---|
+| `desktop_app.py` | **新建** — 单文件 GUI 应用，约 800-1000 行 |
+| `build_exe.py` | **修改** — 添加 tkinter 相关的 hidden-import |
+
+## Window Layout
+
+```
+┌──────────────────────────────────────────────────────┐
+│ ZONE A: Status Bar                                    │
+│ [● 已连接] [阶段: BAN_PICK] [计时: 25s]   [模式: ▼]  │
+├──────────────────────────┬───────────────────────────┤
+│ ZONE B: 我方 (左侧)      │ ZONE C: 敌方 (右侧)       │
+│  Bans: [亚托克斯][亚索] │  Bans: [劫][菲兹]         │
+│  Picks:                 │  Picks:                   │
+│   上单: 德莱厄斯        │   上单: 墨菲特            │
+│   打野: 李青            │   打野: (空)              │
+│   中单: ← 正在选人      │   中单: 阿狸              │
+│   ADC: 金克丝           │   ADC: (空)               │
+│   辅助: 诺提勒斯        │   辅助: (空)              │
+├──────────────────────────┴───────────────────────────┤
+│ ZONE D: 当前动作 & 推荐面板                            │
+│ "⚡ 你正在选人 (mid)"                                  │
+│ #1 凯特琳  S WR 52.3%  +45  克制金克丝/艾希          │
+│ #2 ...                                                │
+├──────────────────────────────────────────────────────┤
+│ ZONE E: 最终总结 (所有选人完成后显示)                  │
+│ 选项卡: [符文&技能] [对位胜率] [阵容分析]              │
+├──────────────────────────────────────────────────────┤
+│ ZONE F: Bottom Bar (手动模式控件 / 退出按钮)           │
+└──────────────────────────────────────────────────────┘
+```
+
+## 线程安全架构
+
+- `poll_lcu()` 在后台 daemon 线程运行
+- 回调通过 `queue.Queue` 传递数据到主线程
+- 主线程用 `root.after(100ms)` 轮询队列并更新 UI
+- 状态去重（MD5 hash）在后台线程完成，避免无效重绘
+
+```
+LCU → poll_lcu[后台线程] → _on_session_callback → Queue
+                                                       ↓
+GUI Widgets ← _process_updates[主线程 after循环] ←─── dequeue
+```
+
+## 核心组件
+
+### `ChampSelectGUI` 类（主控制器）
+- `build_*` 方法构建各区域
+- `update_*` 方法在主线程更新 UI
+- `start_auto_mode()` / `start_manual_mode()` 切换模式
+
+### 关键函数
+- `_on_session_callback(parsed, raw_session)` — 后台线程回调，计算推荐 + 入队
+- `_process_updates(root, gui)` — 主线程轮询队列，调用 GUI 更新方法
+- `_generate_recommendations(parsed, raw_session)` — 复用 lcu_runner.py 的推荐逻辑，返回显示数据
+
+## 模式切换
+
+- **自动模式**：启动 `poll_lcu` 后台线程，实时显示 LCU 数据
+- **手动模式**：设置 `_manual_mode = True`（后台线程暂停），显示下拉框手动输入阵容
+- 通过状态栏 Combobox 切换
+
+## 复用现有代码
+
+- `lcu.py`: `poll_lcu()`, `parse_session()`, `fetch_teammate_mastery()` — 直接导入
+- `recommender.py`: `recommend()` — 直接调用
+- `engine.py`: `build_ban_recommendations()`, `analyze_composition()`, `recommend_runes_spells()`, `predict_matchups()` — 直接调用
+- `champion_data.py`: `ChampionData` 单例 — 直接导入
+- `lane_detector.py`: `predict_enemy_lanes()` — 直接调用
+- `lcu_runner.py`: `_state_hash()`, `_on_session()` 逻辑 — 参考实现，移植到 GUI
+
+## PyInstaller 兼容性
+
+- `--windowed --noconsole` 下 `sys.stdout` 为 None → 重定向到 `os.devnull`
+- 日志写入 `%APPDATA%/LoL BP Assistant/app.log`
+- `build_exe.py` 添加 `--hidden-import=tkinter`, `--hidden-import=tkinter.ttk`, `--hidden-import=queue`
+- `WM_DELETE_WINDOW` 协议安全关闭后台线程
+
+## Implementation Steps
+
+1. **创建骨架** — `desktop_app.py` 窗口 + 图标 + 状态栏 + 退出按钮，验证 PyInstaller 打包
+2. **布局框架** — 所有 Zone 的空 Frame 占位
+3. **团队面板** — Ban/Pick 显示（champion chip 组件）
+4. **线程桥接** — Queue + `after()` 循环，验证自动模式数据流通
+5. **推荐面板** — 可滚动的推荐列表，区分 ban/pick/self/teammate 推荐
+6. **最终总结** — Notebook 选项卡显示符文技能+对位+阵容
+7. **手动模式** — 英雄选择器、位置选择器、手动刷新按钮
+8. **样式美化** — 完整深色主题、段位徽章、胜率条
+9. **打包测试** — `--windowed --noconsole` 构建 exe 并验证全部功能
+
+## Verification
+
+1. `python desktop_app.py` 启动 GUI，确认窗口正常显示
+2. 打开 League 客户端进入训练模式的英雄选择，验证自动模式实时更新
+3. 切换到手动模式，输入阵容，验证推荐生成
+4. `python build_exe.py` 打包 exe，启动 exe 验证 `--windowed --noconsole` 模式正常运行
+5. 验证窗口关闭时后台线程安全退出（无崩溃/挂起）

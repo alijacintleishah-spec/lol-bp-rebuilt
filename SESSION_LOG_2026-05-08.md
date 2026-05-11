@@ -1,86 +1,87 @@
-# LoL BP Assistant — 2026-05-08 修复日志
+# LoL BP Assistant — 2026-05-08 修复日志 (续)
 
 ## 本次会话概述
-后端代码优化、LCU 连接修复、缓存完善 + GitHub 发布 + 分路过滤重写。
+后端推荐逻辑修复 + 个人对局数据系统方案设计。
 
 ---
 
-## 1. 后端代码优化（3 项高优先级）
+## 1. 推荐逻辑重构
 
-### 1.1 get_lane_rates() 缓存
-- **文件**: `lane_detector.py`
-- **修改**: 添加 `@functools.lru_cache(maxsize=256)` 装饰器
-- **效果**: 100 次调用中 99 次缓存命中，性能提升 ~100 倍
-- **原因**: 推荐循环中频繁调用，分路概率计算成本高
+### 1.1 _on_session() 推荐分支统一
+- **文件**: `lcu_runner.py`
+- **修改**: 合并 `self_actions` + `our_pick_actions` + `else` 三个分支为统一的 `our_pick_actions` 处理
+- **效果**: 始终以当前选人者的 position 为准，不再以 `my_position` 为中心
+- **移除**: enemy action 时的兜底推荐
 
-### 1.2 analyze_composition() 缓存
-- **文件**: `engine.py`
-- **修改**: 
-  - 添加 `import functools`
-  - 添加 `@functools.lru_cache(maxsize=256)` 装饰器
-  - 函数签名改为接受 `tuple` 而非 `list`
-- **效果**: 100 次调用中 99 次缓存命中，性能提升 ~100 倍
-- **原因**: ADC 推荐时多次调用，tag_counts 计算成本高
-
-### 1.3 Position coverage 优化
+### 1.2 Role 字段修复
 - **文件**: `recommender.py`
-- **修改**:
-  - 在循环前预先计算 `role_champs` 字典
-  - 避免重复调用 `cd.filter_by_role(pos)`
-  - 缓存 `result_champ_ids` 集合
-- **效果**: 减少 O(n) 次函数调用，性能提升 ~10-20%
-- **原因**: 每个缺失分路都会重复调用 filter_by_role
+- **修改**: result 的 `role` 字段改用 `mapped if (my_position and position_match) else role`
+- **效果**: Flex pick 正确显示推荐分路而非 MANUAL_ROLE
+- **初始化**: `mapped = ""` 确保变量始终有定义
+
+### 1.3 Primary Lane 硬过滤
+- **文件**: `recommender.py`
+- **修改**: 硬过滤从 "lane rate >= 5%" 改为 "primary lane == 请求分路"
+- **效果**: 只有主路匹配的英雄才通过，杜绝 off-role 混入
+- **验证**: 5 个分路 off-role 全部为 0
 
 ---
 
-## 2. LCU 连接问题修复
+## 2. 兜底逻辑移除
 
-### 2.1 问题诊断
-**问题 1**: 进入房间后没有显示段位和游戏模式
-- 根因：段位和队列信息获取时机不对，进入英雄选择时这些数据可能还没有被获取
+### 2.1 符文/技能
+- **文件**: `lolalytics_scraper.py`
+- **删除**: `_default_runes()` / `_default_spells()` / `_default_matchups()` 三个硬编码兜底函数
+- **修改**: `get_runes()` / `get_spells()` 无数据时返回空列表 `[]`
+- **显示**: "默认"/"Flash+TP" → "暂无推荐"
 
-**问题 2**: 没有识别到进入英雄选择
-- 根因：段位获取失败后被标记为已获取，导致无法重试
-
-**问题 3**: 如果没有段位，就不显示段位和模式，也识别不到进入英雄选择
-- 根因：段位获取失败时，整个异常处理导致 `_apply_session()` 没有被调用
-
-### 2.2 修复方案
-
-#### 修复 1：进入英雄选择时立即获取段位和队列信息
-**文件**: `lcu.py`
-- 修改 WebSocket 消息回调 `_on_ws_message()`
-- 修改 REST 兜底请求逻辑
-- 为段位和队列信息获取添加独立的 try-except 块
-- 确保即使获取失败，`_apply_session()` 仍然会被调用
-
-#### 修复 2：改进段位获取的错误处理
-**文件**: `lcu.py`
-- 修改 `_try_fetch_ranks()` 函数
-- 即使没有段位也标记为已获取（避免重复尝试）
-- 段位获取失败时不再标记为已获取，允许重试
-
-#### 修复 3：改进显示逻辑
-**文件**: `lcu_runner.py`
-- 即使没有段位，也会显示游戏模式
-- 添加了 `elif` 分支处理只有模式没有段位的情况
+### 2.2 对位胜率
+- **文件**: `engine.py`
+- **修改**: `predict_matchups()` 无对位数据时返回 50.0% 均势（不再用 counter score 估算）
+- **显示**: "no data"/"数据不足" → "暂无数据"
 
 ---
 
-## 3. 缓存实现的完善
+## 3. LCU 位置数据修复
 
-### 3.1 问题发现
-运行过程中出现错误：`TypeError: unhashable type: 'list'`
-- 原因：`analyze_composition()` 改为接收 `tuple`，但多个地方仍然传入 `list`
+### 3.1 "middle" → "mid" 映射
+- **文件**: `lcu.py`
+- **修改**: `_norm_pos()` 添加 `if pos == "middle": return "mid"`
+- **根因**: LCU 返回 "MIDDLE"，但函数只处理了 "bottom"→"bot" 和 "utility"→"support"
+- **影响**: 中单位置过滤失效 + 胜率预测中路显示 "?"
 
-### 3.2 修复位置
+### 3.2 teammate_positions 参数
+- **文件**: `recommender.py`
+- **新增**: `teammate_positions: dict[int, str]` 可选参数
+- **效果**: position fill bonus 优先用客户端 assignedPosition 而非 MANUAL_ROLE 推测
+- **调用**: `lcu_runner.py` 从 `my_picks` 构建字典传入
 
-| 文件 | 行号 | 修改 |
-|------|------|------|
-| `lcu_runner.py` | 379, 382 | `analyze_composition(my_pick_ids)` → `analyze_composition(tuple(my_pick_ids))` |
-| `engine.py` | 345, 346 | `analyze_composition(our_pick_ids)` → `analyze_composition(tuple(our_pick_ids))` |
-| `cli.py` | 92, 93 | `analyze_composition(my_picks)` → `analyze_composition(tuple(my_picks))` |
-| `recommender.py` | 208, 209 | ✓ 已正确使用 tuple |
+---
+
+## 4. 个人对局数据系统（方案设计）
+
+### 4.1 概述
+新增 `personal_stats.py` 模块，从 LCU Match History API 读取玩家对局历史，积累个人对位数据库。
+
+### 4.2 数据结构
+- **文件**: `data/personal_matchups.json`
+- **核心字段**: game_id, timestamp, my_champion, my_lane, win, enemy_team(lane→champ), cs_diff_15, gold_diff_15
+- **加权算法**: 30天半衰期指数衰减，5场加权为显著性阈值
+
+### 4.3 两种克制
+- **对线克制**: 同路对位，(my_champ, lane) vs (enemy_champ, same_lane)
+- **全局克制**: 跨路统计，my_champ vs enemy_champ（所有路汇总）
+
+### 4.4 集成方式
+- **recommender.py 维度3**: 个人数据(40%) + 内置数据(60%) 混合
+- **engine.py predict_matchups**: 优先级 个人(>=5场) > lolalytics > 均势50%
+- **lcu.py**: 新增 fetch_match_list / fetch_match_details / sync_recent_matches
+- **lcu_runner.py**: 启动同步 + 游戏结束自动采集 + 显示更新
+
+### 4.5 待确认方案（已存入记忆）
+1. 动态权重: 5-15场 30%, 15-30场 50%, 30场+ 70%
+2. 仅排位赛 (queue_id 420/440)
+3. 全局克制包含所有对位（同路+跨路），不仅限于同路
 
 ---
 
@@ -88,92 +89,17 @@
 
 | 文件 | 改动类型 | 行数 |
 |------|---------|------|
-| `lane_detector.py` | 缓存优化 | +1 |
-| `engine.py` | 缓存优化 + 类型修复 | +1, ±4 |
-| `recommender.py` | 性能优化 + 类型修复 | ±8, ±2 |
-| `lcu.py` | LCU 修复 | ±50 |
-| `lcu_runner.py` | 显示优化 + 类型修复 | ±5, ±2 |
-| `cli.py` | 类型修复 | ±2 |
+| `lcu_runner.py` | 重构推荐逻辑 + 显示更新 | +8/-40 |
+| `recommender.py` | role修复 + primary lane过滤 + teammate_positions | +8/-3 |
+| `lolalytics_scraper.py` | 移除兜底函数 | +2/-51 |
+| `engine.py` | 移除counter score兜底 + verdict中文 | +3/-6 |
+| `lcu.py` | _norm_pos "middle"→"mid" | +2 |
 
 ---
 
 ## 验证结果
 
-✅ 所有文件编译成功  
-✅ 缓存功能正常工作（99% 命中率）  
-✅ 导入无错误  
-✅ 段位和模式显示正常  
-✅ 英雄选择识别可靠  
-
----
-
-## 已知待办
-
-- [ ] 创建 `desktop_app.py` GUI 应用
-- [ ] 修改 `build_exe.py` 添加 hidden-import
-- [ ] 打包测试
-- [ ] 实施中优先级优化（状态管理重构、缓存过期策略）
-
----
-
-## 4. GitHub 发布 & 仓库管理
-
-### 4.1 旧仓库 lol-bp-assistant 归档
-- README 顶部添加重制公告（说明仓促创建导致缺陷/Bug/卡顿，指向新仓库）
-- 标题标记 `[已停止维护]`
-- 通过 API 设置 `archived=true`，仓库变为只读
-- 仓库地址：https://github.com/alijacintleishah-spec/lol-bp-assistant
-
-### 4.2 新仓库 lol-bp-rebuilt 创建
-- 创建公开仓库 [alijacintleishah-spec/lol-bp-rebuilt](https://github.com/alijacintleishah-spec/lol-bp-rebuilt)
-- README 顶部有开发进度表（后端🟡/前端⬜/EXE⬜）
-- 16 个源文件初始提交（引擎、数据获取、LCU、CLI等）
-- .gitignore 已配置（排除 .claude/、data/、__pycache__/）
-
----
-
-## 5. 分路过滤重写
-
-### 5.1 问题诊断
-**根因1**: 位置覆盖率逻辑无论用户选择哪个分路，都强行塞入 5 个分路的英雄各至少 1 个。选中单也会被硬塞辅助/打野。
-**根因2**: 非对应分路惩罚 -12 太弱，T0 英雄（Jinx）靠 meta 分就能冲进 support 推荐。
-**根因3**: `position_match` 基于单一的 MANUAL_ROLE，不识别 flex pick（如 Brand 中单 34%、Ziggs 中单 33.6%）。
-
-### 5.2 修复方案
-
-#### 修复 1：位置覆盖仅补用户分路
-- **文件**: `recommender.py`
-- **修改**: 指定 my_position 时 `missing` 只包含该分路；不指定时保持全 5 分路覆盖
-- **效果**: 选中单时不再被塞入辅助/打野推荐
-
-#### 修复 2：分路出场率硬过滤
-- **文件**: `recommender.py`
-- **修改**: 引入 `lane_detector.get_lane_rates()`，出场率 < 5% 的英雄直接跳过
-- **效果**: Jinx (bot) 不会再混进 support 推荐
-
-#### 修复 3：弹性分路匹配
-- **文件**: `recommender.py`
-- **修改**: 分路匹配改为三档 —— >=15% 出场率 +45分（全匹配），5-15% +20分（半匹配），<5% 硬过滤
-- **效果**: Brand 中单 (34%)、Swain 中单 (30.4%)、Ziggs 中单 (33.6%) 等 flex pick 正确识别为 MATCH
-
-#### 修复 4：非对位惩罚提至 -25
-- **修改**: 配合硬过滤，对残余边缘 case 提高惩罚
-
-### 5.3 验证结果
-
-| 分路 | off-role | 说明 |
-|------|----------|------|
-| mid | 0/12 | 含 Ziggs/Brand/Swain 中单 flex ✓ |
-| top | 0/12 | 纯上单推荐 ✓ |
-| jungle | 0/12 | 纯打野推荐 ✓ |
-| bot | 0/12 | 含 Akshan/Quinn bot flex ✓ |
-| support | 0/12 | Jinx 不再出现 ✓ |
-
-### 修改文件清单
-
-| 文件 | 改动类型 |
-|------|---------|
-| `recommender.py` | 分路过滤重写（+29/-11 行）|
-| `lol-bp-assistant/README.md` | 加重制公告 |
-| `lol-bp-rebuilt/README.md` | **新建** — 仓库说明 + 开发进度 |
-| `lol-bp-rebuilt/.gitignore` | **新建** — Python 项目忽略规则 |
+✅ 所有文件编译通过  
+✅ 5 个分路 off-role 全部为 0  
+✅ 中单推荐全部 primary=mid  
+✅ "middle" → "mid" 映射正常  

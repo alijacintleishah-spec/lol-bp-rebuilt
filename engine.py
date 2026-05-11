@@ -11,6 +11,16 @@ cd = get_champion_data()
 
 # ── Ban Recommendation (4 dimensions, based on prepicks) ─────────────────────
 
+def _get_matchup_from_stats(champion_id: int, enemy_id: int,
+                             lane: str) -> dict | None:
+    """Get matchup stats from personal/global data. Returns None if insufficient."""
+    try:
+        from stats_engine import get_counter_matchup_stats
+        return get_counter_matchup_stats(champion_id, enemy_id, lane, min_games=5)
+    except Exception:
+        return None
+
+
 def build_ban_recommendations(used_ids, my_prepicks, enemy_prepicks, my_position,
                               teammate_pool=None, per_role=5):
     """返回五个分路的 Ban 推荐，每个分路 top N。"""
@@ -262,7 +272,7 @@ def predict_matchups(our_team: dict[str, int],
             enemy_supp = enemy_team.get("support")
 
             if not our_adc and not our_supp and not enemy_adc and not enemy_supp:
-                lane_predictions[lane] = {"our_wr": 50.0, "verdict": "no data",
+                lane_predictions[lane] = {"our_wr": 50.0, "verdict": "暂无数据",
                                            "our_heroes": [], "enemy_heroes": []}
                 continue
 
@@ -278,9 +288,7 @@ def predict_matchups(our_team: dict[str, int],
                     if mu:
                         scores.append(mu.get("wr_delta", 0))
                     else:
-                        cs, _ = cd.get_counter_score(our, [enemy])
-                        cds, _ = cd.get_countered_score(our, [enemy])
-                        scores.append(cs - cds)
+                        scores.append(0)  # 无数据，中性贡献
                 else:
                     scores.append(0)
 
@@ -306,18 +314,24 @@ def predict_matchups(our_team: dict[str, int],
             if not our_hero or not enemy_hero:
                 our_heroes = [cd.get_name(our_hero)] if our_hero else []
                 enemy_heroes = [cd.get_name(enemy_hero)] if enemy_hero else []
-                lane_predictions[lane] = {"our_wr": 50.0, "verdict": "no data",
+                lane_predictions[lane] = {"our_wr": 50.0, "verdict": "暂无数据",
                                            "our_heroes": our_heroes, "enemy_heroes": enemy_heroes}
                 continue
 
-            matchup = get_matchup(our_hero, enemy_hero, lane)
-            if matchup:
-                wr_delta = matchup.get("wr_delta", 0)
+            # Three-tier data source: personal >=5 > lolalytics > neutral
+            pers = _get_matchup_from_stats(our_hero, enemy_hero, lane)
+            if pers:
+                wr_delta = (pers["win_rate"] - 50.0) * 2
                 our_wr = 50.0 + wr_delta / 2
+                gd10 = pers.get("avg_gold_diff_10", 0)
+                our_wr += max(-3.0, min(3.0, gd10 / 200))
             else:
-                c_score, _ = cd.get_counter_score(our_hero, [enemy_hero])
-                cd_score, _ = cd.get_countered_score(our_hero, [enemy_hero])
-                our_wr = 50.0 + (c_score - cd_score) / 2
+                matchup = get_matchup(our_hero, enemy_hero, lane)
+                if matchup:
+                    wr_delta = matchup.get("wr_delta", 0)
+                    our_wr = 50.0 + wr_delta / 2
+                else:
+                    our_wr = 50.0
 
             our_heroes = [cd.get_name(our_hero)]
             enemy_heroes = [cd.get_name(enemy_hero)]

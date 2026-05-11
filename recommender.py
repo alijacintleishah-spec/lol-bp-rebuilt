@@ -40,6 +40,73 @@ HIGH_DIFFICULTY = {238, 64, 157, 84, 28, 141, 92, 147, 164, 245, 240, 223, 234}
 
 POSITION_MAP = {"top":"top","jungle":"jungle","mid":"mid","bottom":"bot","bot":"bot","utility":"support","support":"support"}
 
+# ── Global stats (loaded from merged file if present) ──
+_global_stats: dict | None = None
+
+
+def _load_global_stats():
+    """Load global_stats.json if available."""
+    global _global_stats
+    if _global_stats is not None:
+        return
+    try:
+        import os, sys, json
+        if getattr(sys, 'frozen', False):
+            data_dir = os.path.join(sys._MEIPASS, "data")
+        else:
+            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        path = os.path.join(data_dir, "global_stats.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                _global_stats = json.load(f)
+    except Exception:
+        _global_stats = {}
+
+
+def _get_personal_counter(champion_id: int, enemy_id: int,
+                           mapped_role: str, my_position: str) -> dict | None:
+    """Get personal/global counter stats for a champion matchup.
+
+    Priority: global stats (>=10 games) > personal stats (>=5 games)
+    """
+    # 1. Try global stats (multi-user aggregate)
+    if _global_stats:
+        try:
+            cid_str = str(champion_id)
+            eid_str = str(enemy_id)
+            entry = (_global_stats.get("stats", {})
+                     .get("counter_matchups", {})
+                     .get(cid_str, {})
+                     .get(mapped_role, {})
+                     .get(eid_str))
+            if entry and entry.get("g", 0) >= 10:
+                g = entry["g"]
+                w = entry["w"]
+                wr = round(w / g * 100, 1)
+                from stats_engine import _classify_game_counter, _classify_lane_counter
+                gd10 = entry.get("gd10", 0)
+                cd10 = entry.get("cd10", 0)
+                xd10 = entry.get("xd10", 0)
+                return {
+                    "games": g, "wins": w, "win_rate": wr,
+                    "game_counter": _classify_game_counter(wr),
+                    "avg_gold_diff_10": gd10,
+                    "avg_cs_diff_10": cd10,
+                    "avg_xp_diff_10": xd10,
+                    "lane_counter": _classify_lane_counter(gd10, cd10, xd10),
+                }
+        except Exception:
+            pass
+
+    # 2. Try personal local stats
+    try:
+        from stats_engine import get_counter_matchup_stats
+        return get_counter_matchup_stats(champion_id, enemy_id, mapped_role, min_games=5)
+    except Exception:
+        pass
+
+    return None
+
 
 def _get_rank_modifier(rank_tier: str) -> dict:
     """Return rank-based scoring modifiers."""
@@ -60,11 +127,13 @@ def _pick_id(pick) -> int:
 def recommend(my_position: str, enemy_ids: list[int] | None = None,
               banned_ids: list[int] | None = None,
               teammate_ids: list[int] | None = None, top_n: int = 12,
-              rank_tier: str = "") -> list[dict]:
+              rank_tier: str = "",
+              teammate_positions: dict[int, str] | None = None) -> list[dict]:
     """7-dimension recommendation engine with optional rank-based adjustment."""
     if enemy_ids is None: enemy_ids = []
     if banned_ids is None: banned_ids = []
     if teammate_ids is None: teammate_ids = []
+    if teammate_positions is None: teammate_positions = {}
 
     # Rank-based weight modifiers
     # High elo: meta matters more; Low elo: simple champions preferred
@@ -78,14 +147,16 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
             continue
 
         # Hard filter: when position is specified, only consider champions
-        # with >= 5% play rate in that lane (data-driven via OP.GG lane dist)
+        # whose primary lane (highest play rate) matches the requested lane
         lane_rate = 0.0
+        mapped = ""
         if my_position:
             mapped = POSITION_MAP.get(my_position.lower(), "")
             if mapped:
                 lane_rates = dict(get_lane_rates(ckey))
                 lane_rate = lane_rates.get(mapped, 0)
-                if lane_rate < 5.0:
+                primary_lane = max(lane_rates, key=lane_rates.get) if lane_rates else ""
+                if primary_lane != mapped:
                     continue
 
         score = 0.0
@@ -109,8 +180,7 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
         if rank_mod["apply_diff_penalty"] and ckey in HIGH_DIFFICULTY:
             score -= 8
 
-        # 2. Position match (lane-distribution-aware: flex picks with
-        # real off-role presence are recognized as valid for that lane)
+        # 2. Position match — only primary-lane heroes reach here
         position_match = False
         if my_position and mapped:
             if lane_rate >= 15.0:
@@ -119,7 +189,6 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
             elif lane_rate >= 5.0:
                 score += 20
                 position_match = True
-            # lane_rate < 5.0 already filtered out above
 
         # 3. Counter / countered
         counter_score = 0; countered_score = 0
@@ -166,6 +235,30 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
             reasons.append(f"被{'/'.join(countered_names)}克制")
         score -= countered_score * 0.8
 
+        # 3b. Personal counter stats (game + lane counter, independent dimensions)
+        for ek in enemy_ids:
+            if my_position:
+                pers_stats = _get_personal_counter(ckey, ek, mapped, my_position)
+                if pers_stats:
+                    game_counter = pers_stats["game_counter"]
+                    if "克制" in game_counter and "被" not in game_counter:
+                        bonus = 18 if "强" in game_counter else 10
+                        counter_score += bonus
+                        reasons.insert(0,
+                            f"对局克制{cd.get_name(ek)}({pers_stats['win_rate']:.0f}%)")
+                    elif "被克制" in game_counter:
+                        penalty = 18 if "强" in game_counter else 10
+                        countered_score += penalty
+                        reasons.append(
+                            f"对局被{cd.get_name(ek)}克制({pers_stats['win_rate']:.0f}%)")
+
+                    lane_counter = pers_stats["lane_counter"]
+                    gd10 = pers_stats.get("avg_gold_diff_10", 0)
+                    if "克制" in lane_counter and "被" not in lane_counter:
+                        reasons.append(f"对线压{cd.get_name(ek)}(+{gd10:.0f}g)")
+                    elif "被克制" in lane_counter:
+                        reasons.append(f"对线劣{cd.get_name(ek)}({gd10:.0f}g)")
+
         # 4. Synergy
         syn_score, syn_names = cd.get_synergy_score(ckey, teammate_ids)
         if syn_names:
@@ -178,7 +271,10 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
         elif br > 5: score += 4
 
         # 6. Position fill bonus (missing role gets priority)
-        team_roles = {cd.get_role(p) for p in teammate_ids}
+        if teammate_positions:
+            team_roles = set(teammate_positions.values())
+        else:
+            team_roles = {cd.get_role(p) for p in teammate_ids}
         if role not in team_roles and my_position:
             score += 15
 
@@ -232,7 +328,7 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
             "champion_id": ckey,
             "name": cd.get_name(ckey),
             "image_url": cd.get_image(ckey),
-            "role": role,
+            "role": mapped if (my_position and position_match) else role,
             "tier": effective_tier,
             "winrate": wr,
             "score": round(score, 1),

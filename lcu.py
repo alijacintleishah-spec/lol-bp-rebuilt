@@ -282,6 +282,8 @@ def _norm_pos(pos):
     pos = pos.lower()
     if pos == "bottom":
         return "bot"
+    if pos == "middle":
+        return "mid"
     if pos == "utility":
         return "support"
     return pos
@@ -426,6 +428,50 @@ def _has_players(session):
     if actions and len(actions) > 0 and len(actions[0]) > 0:
         return True
     return False
+
+
+def _on_game_end(headers, base_url, lcu_conn):
+    """Handle game end: wait for LCU to write match data, then collect."""
+    lcu_conn["_collecting"] = True
+    try:
+        logger.info("检测到对局结束，等待 LCU 写入数据...")
+        time.sleep(8)  # LCU needs time to write match to history
+
+        # Get PUUID and rank tier
+        puuid = ""
+        try:
+            r = requests.get(
+                f"{base_url}/lol-summoner/v1/current-summoner",
+                headers=headers, verify=False, timeout=5
+            )
+            if r.status_code == 200:
+                puuid = r.json().get("puuid", "")
+        except Exception:
+            logger.debug("Failed to get PUUID for match collection", exc_info=True)
+
+        rank_tier = "UNRANKED"
+        ranks = lcu_conn.get("ranks", {})
+        queue_key = lcu_conn.get("queue_key", "solo_duo")
+        if queue_key in ranks:
+            rank_tier = ranks[queue_key].get("tier", "UNRANKED")
+        elif "solo_duo" in ranks:
+            rank_tier = ranks["solo_duo"].get("tier", "UNRANKED")
+
+        if puuid:
+            import match_collector
+            match_collector.init_db()
+            new_games = match_collector.collect_match_history(
+                headers, base_url, rank_tier, puuid
+            )
+            if new_games:
+                # Try timeline collection immediately
+                match_collector.collect_match_timeline(headers, base_url)
+        else:
+            logger.warning("Cannot collect match: PUUID unavailable")
+    except Exception:
+        logger.exception("Game-end collection failed")
+    finally:
+        lcu_conn["_collecting"] = False
 
 
 def poll_lcu(mstate, lcu_conn, manual_mode_ref, on_session_parsed_cb):
@@ -727,6 +773,24 @@ def poll_lcu(mstate, lcu_conn, manual_mode_ref, on_session_parsed_cb):
                 prev = mstate.get("gameflow_phase", "")
                 if phase != prev:
                     logger.info("Gameflow: %s → %s", prev or "(初始)", phase)
+
+                    # Game end detection:
+                    # 1. Exact transition: InProgress → end phase
+                    # 2. Fallback: phase IS end phase and we entered champ select
+                    #    this session (catches transitions missed between poll cycles)
+                    is_end_phase = phase in {"WaitingForStats", "PreEndOfGame", "EndOfGame"}
+                    was_in_game = (prev == "InProgress" or
+                                   mstate.get("_was_in_champ_select"))
+                    if (is_end_phase and was_in_game and
+                        not lcu_conn.get("_collecting")):
+                        _on_game_end(headers, base_url, lcu_conn)
+
+                    # Track champ select entry for fallback detection
+                    if mstate.get("in_champ_select"):
+                        mstate["_was_in_champ_select"] = True
+                    elif phase in {"WaitingForStats", "PreEndOfGame", "EndOfGame"}:
+                        mstate["_was_in_champ_select"] = False
+
                 mstate["gameflow_phase"] = phase
             else:
                 mstate["gameflow_phase"] = ""
@@ -748,3 +812,118 @@ def poll_lcu(mstate, lcu_conn, manual_mode_ref, on_session_parsed_cb):
 
         was_connected = mstate["connected"]
         time.sleep(POLL_INTERVAL)
+
+
+# ── Match History & Timeline ──────────────────────────────────────────────────
+
+def fetch_match_list(headers: dict, base_url: str, puuid: str,
+                     beg_index: int = 0, end_index: int = 20) -> list[dict] | None:
+    """Fetch recent match history from LCU.
+
+    GET /lol-match-history/v1/products/lol/{puuid}/matches
+    Returns list of match dicts with participants, stats, etc.
+    """
+    try:
+        url = (f"{base_url}/lol-match-history/v1/products/lol"
+               f"/{puuid}/matches?begIndex={beg_index}&endIndex={end_index}")
+        r = requests.get(url, headers=headers, verify=False, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return data.get("games", {}).get("games", [])
+        else:
+            logger.debug("Match list: HTTP %d", r.status_code)
+            return None
+    except Exception:
+        logger.debug("Failed to fetch match list", exc_info=True)
+        return None
+
+
+def fetch_match_timeline(headers: dict, base_url: str,
+                          game_id: int) -> dict | None:
+    """Fetch full match timeline from LCU.
+
+    GET /lol-match-history/v1/matches/{gameId}/timeline
+    Returns timeline JSON with frames[] (60s intervals).
+    Each frame.participantFrames[]: totalGold, minionsKilled,
+    jungleMinionsKilled, xp, level, championStats, damageStats.
+    """
+    try:
+        url = f"{base_url}/lol-match-history/v1/matches/{game_id}/timeline"
+        r = requests.get(url, headers=headers, verify=False, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            logger.debug("Timeline for game %s: HTTP %d", game_id, r.status_code)
+            return None
+    except Exception:
+        logger.debug("Failed to fetch timeline for game %s", game_id, exc_info=True)
+        return None
+
+
+def extract_10min_stats(timeline: dict) -> dict[int, dict]:
+    """Extract 10-minute snapshot from timeline data.
+
+    Timeline frames are at 60s intervals. Frame index 10 = 10:00 mark.
+    Returns {participant_id: {total_gold, minions_killed,
+                               jungle_minions_killed, xp, level}}
+    Falls back to last available frame if game <10 min.
+    """
+    frames = timeline.get("frames", [])
+    if not frames:
+        return {}
+
+    target_frame = frames[10] if len(frames) > 10 else frames[-1]
+    if len(frames) <= 10:
+        logger.debug("Timeline has only %d frames, using last for 10min snapshot",
+                     len(frames))
+
+    snapshots = {}
+    p_frames = target_frame.get("participantFrames", {})
+    for pid_str, p_data in p_frames.items():
+        pid = int(pid_str)
+        snapshots[pid] = {
+            "total_gold": p_data.get("totalGold", 0),
+            "minions_killed": p_data.get("minionsKilled", 0),
+            "jungle_minions_killed": p_data.get("jungleMinionsKilled", 0),
+            "xp": p_data.get("xp", 0),
+            "level": p_data.get("level", 0),
+        }
+    return snapshots
+
+
+def detect_game_end(previous_phase: str, current_phase: str) -> bool:
+    """Detect game end via gameflow phase transition.
+
+    Game ends when phase changes from 'InProgress' to one of:
+    'WaitingForStats', 'PreEndOfGame', 'EndOfGame'.
+    """
+    if not previous_phase or not current_phase:
+        return False
+    if previous_phase == "InProgress" and current_phase in \
+       {"WaitingForStats", "PreEndOfGame", "EndOfGame"}:
+        return True
+    return False
+
+
+def fetch_match_detail(headers: dict, base_url: str,
+                        game_id: int) -> dict | None:
+    """Fetch full match detail with all 10 participants from LCU.
+
+    GET /lol-match-history/v1/matches/{gameId}
+    Returns full match JSON with all 10 participants and their stats.
+    The match list endpoint only returns the requesting player's data,
+    so we must use this endpoint to get all 10.
+    """
+    try:
+        url = f"{base_url}/lol-match-history/v1/games/{game_id}"
+        r = requests.get(url, headers=headers, verify=False, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        else:
+            logger.debug("Match detail for game %s: HTTP %d",
+                         game_id, r.status_code)
+            return None
+    except Exception:
+        logger.debug("Failed to fetch match detail for game %s",
+                     game_id, exc_info=True)
+        return None

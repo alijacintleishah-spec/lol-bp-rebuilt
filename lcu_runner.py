@@ -145,6 +145,35 @@ def _print_data_status():
         rank_status = "✓ " + "  ".join(parts)
     mode_status = f"✓ {queue_name}" if queue_name and "未知" not in queue_name else "✗ 未检测"
 
+    # Personal/global stats
+    pers_info = "✗ 暂无数据"
+    global_info = "✗ 暂无全局统计"
+    try:
+        from match_collector import get_db_stats
+        db_s = get_db_stats()
+        if db_s["total_games"] > 0:
+            pers_info = (f"✓ {db_s['total_games']}局 "
+                         f"({db_s['unique_champions']}英雄) "
+                         f"{db_s['db_size_mb']}MB")
+        if db_s["games_with_timeline"] < db_s["total_games"]:
+            pers_info += f" ⏳{db_s['total_games'] - db_s['games_with_timeline']}"
+    except Exception:
+        pass
+
+    try:
+        import os, sys, json
+        if getattr(sys, 'frozen', False):
+            data_dir = os.path.join(sys._MEIPASS, "data")
+        else:
+            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        gpath = os.path.join(data_dir, "global_stats.json")
+        if os.path.exists(gpath):
+            with open(gpath, "r", encoding="utf-8") as f:
+                gs = json.load(f)
+            global_info = f"✓ {gs.get('total_games', 0)}局 (多人汇总)"
+    except Exception:
+        pass
+
     print(f"""
   ┌─ 数据源状态 ─────────────────────────────────────┐
   │ LCU:  {conn_status:<38s} │
@@ -156,8 +185,11 @@ def _print_data_status():
   │ Meta 数据 │ {meta_src:<32s} │
   │ 符文      │ {tc_info:<32s} │
   │ 技能      │ {tc_info:<32s} │
-  │ 对位胜率  │ 内置克制矩阵 (估算值):16s              │
+  │ 对位胜率  │ 内置克制矩阵 + 对位数据:16s              │
   │ 分路检测  │ 标签概率 + OP.GG 混合:16s              │
+  │                                                  │
+  │ 全局数据 │ {global_info:<36s} │
+  │ 个人数据 │ {pers_info:<36s} │
   └──────────────────────────────────────────────────┘""")
 
 
@@ -212,6 +244,7 @@ def _on_session(parsed_state, raw_session=None):
     used = set(my_bans + enemy_bans + [p["champion_id"] for p in my_picks + enemy_picks])
     my_pick_ids = [p["champion_id"] for p in my_picks]
     enemy_pick_ids = [p["champion_id"] for p in enemy_picks]
+    teammate_positions = {p["champion_id"]: p["position"] for p in my_picks if p.get("position") and p["position"] != "unknown"}
     ban_only = set(my_bans + enemy_bans)
 
     all_picks_done = len(my_picks) >= 5 and len(enemy_picks) >= 5
@@ -300,14 +333,10 @@ def _on_session(parsed_state, raw_session=None):
             _show_final_summary(my_picks, enemy_picks, teammate_pool)
         return  # Don't show any pick/ban recommendations after all picks done
 
-    # Determine action type from first item; handle duo picks
+    # Determine action type; handle duo picks
     our_actions = [a for a in next_actions if a.get("is_mine")]
-    enemy_actions = [a for a in next_actions if not a.get("is_mine")]
-    self_actions = [a for a in next_actions if a.get("is_self")]
     our_ban_actions = [a for a in our_actions if a["type"] == "ban"]
     our_pick_actions = [a for a in our_actions if a["type"] == "pick"]
-    enemy_ban_actions = [a for a in enemy_actions if a["type"] == "ban"]
-    enemy_pick_actions = [a for a in enemy_actions if a["type"] == "pick"]
 
     if our_ban_actions:
         # ── Our team is banning, show per-role recommendations ──
@@ -328,50 +357,30 @@ def _on_session(parsed_state, raw_session=None):
                 reasons = " · ".join(r.get("reasons", [])[:2])
                 print(f"  #{i+1}  {r['name']:10s} {r['tier']} WR {r['winrate']:.1f}%  +{r['score']:.0f}  {reasons}")
 
-    elif self_actions:
-        # ── You are picking (possibly alongside a teammate in duo pick) ──
-        # Show your recommendation first, then teammate's if applicable
-        self_action = self_actions[0]
-        recs = recommend(my_position, enemy_pick_ids, list(ban_only), my_pick_ids,
-                         rank_tier=rank_tier)
-        print(f"  >>> 你的 Pick 推荐 ({my_position})")
-        for i, r in enumerate(recs[:8]):
-            pos_tag = "✓对位" if r.get("position_match") else ""
-            reasons = " · ".join(r.get("reasons", [])[:3])
-            print(f"  #{i+1:<2} {r['name']:10s} {r['tier']} WR {r['winrate']:.1f}%  +{r['score']:.0f}  {pos_tag}  {reasons}")
-
-        # Also show for co-picking teammate
-        teammate_actions = [a for a in our_pick_actions if not a.get("is_self")]
-        for ta in teammate_actions:
-            tpos = ta.get("position", "")
-            trecs = recommend(tpos, enemy_pick_ids, list(ban_only), my_pick_ids,
-                              rank_tier=rank_tier)
-            print(f"\n  >>> 同时推荐 — 队友 ({tpos})")
-            for i, r in enumerate(trecs[:5]):
-                reasons = " · ".join(r.get("reasons", [])[:3])
-                print(f"  #{i+1}  {r['name']:10s} {r['tier']} WR {r['winrate']:.1f}%  +{r['score']:.0f}  {reasons}")
-
     elif our_pick_actions:
-        # ── Teammate(s) picking, not you ──
-        for ta in our_pick_actions:
-            tpos = ta.get("position", "")
-            trecs = recommend(tpos, enemy_pick_ids, list(ban_only), my_pick_ids,
-                              rank_tier=rank_tier)
-            print(f"  >>> 队友 Pick 推荐 ({tpos})")
-            for i, r in enumerate(trecs[:5]):
+        # ── Our team is picking — recommend for each picker's position ──
+        for action in our_pick_actions:
+            pos = action.get("position", "")
+            is_self = action.get("is_self", False)
+            if is_self:
+                label = "你的"
+                top_n = 8
+                if not pos:
+                    pos = my_position
+            else:
+                label = "队友"
+                top_n = 5
+            recs = recommend(pos, enemy_pick_ids, list(ban_only), my_pick_ids,
+                             rank_tier=rank_tier,
+                             teammate_positions=teammate_positions)
+            pos_display = pos or "未知"
+            print(f"  >>> {label} Pick 推荐 ({pos_display})")
+            for i, r in enumerate(recs[:top_n]):
+                pos_tag = "✓对位" if r.get("position_match") else ""
                 reasons = " · ".join(r.get("reasons", [])[:3])
-                print(f"  #{i+1}  {r['name']:10s} {r['tier']} WR {r['winrate']:.1f}%  +{r['score']:.0f}  {reasons}")
+                print(f"  #{i+1:<2} {r['name']:10s} {r['tier']} WR {r['winrate']:.1f}%  +{r['score']:.0f}  {pos_tag}  {reasons}")
             if len(our_pick_actions) > 1:
-                print()  # Separator between multiple teammate recs
-
-    else:
-        # ── Enemy action or unknown ──
-        recs = recommend(my_position, enemy_pick_ids, list(ban_only), my_pick_ids,
-                         rank_tier=rank_tier)
-        print(f"  >>> 参考推荐 ({my_position or '全局'})")
-        for i, r in enumerate(recs[:5]):
-            reasons = " · ".join(r.get("reasons", [])[:3])
-            print(f"  #{i+1}  {r['name']:10s} {r['tier']} WR {r['winrate']:.1f}%  +{r['score']:.0f}  {reasons}")
+                print()  # Separator between multiple picker recs
 
     # ── Composition preview (after 3+ picks on either team) ──
     if len(my_pick_ids) >= 3 or len(enemy_pick_ids) >= 3:
@@ -414,8 +423,8 @@ def _show_final_summary(my_picks, enemy_picks, teammate_pool):
                 lane = data.get("lane", "?")
                 runes = data.get("runes", [])
                 spells = data.get("spells", [])
-                r_str = _format_rune(runes[0]) if runes else "默认"
-                s_str = _format_spells(spells[0]) if spells else "Flash+TP"
+                r_str = _format_rune(runes[0]) if runes else "暂无推荐"
+                s_str = _format_spells(spells[0]) if spells else "暂无推荐"
                 print(f"  {data['champion_name']:8s} ({lane:7s})  "
                       f"符文: {r_str:<20s}  技能: {s_str}")
 
@@ -440,7 +449,7 @@ def _show_final_summary(my_picks, enemy_picks, teammate_pool):
             # Show lane even when data is incomplete
             our_display = our_names or "?"
             enemy_display = enemy_names or "?"
-            print(f"  {label:5s}  {our_display:14s} vs {enemy_display:14s}  {'─':>10} 数据不足")
+            print(f"  {label:5s}  {our_display:14s} vs {enemy_display:14s}  {'─':>10} 暂无数据")
     print(f"  {'─'*45}")
     bar = _winrate_bar(lane_wr.get("our_wr", 50))
     print(f"  对线综合:  {bar} {lane_wr.get('our_wr', 50):.1f}%  {lane_wr.get('verdict', '?')}")
@@ -465,7 +474,7 @@ def _pick_names(picks):
 
 def _format_rune(rune_page):
     if not rune_page:
-        return "默认"
+        return "暂无推荐"
     keystone = rune_page.get("keystone", "")
     primary = rune_page.get("primary", "")
     secondary = rune_page.get("secondary", "")
@@ -476,9 +485,9 @@ def _format_rune(rune_page):
 
 def _format_spells(spell_page):
     if not spell_page:
-        return "闪现+传送"
+        return "暂无推荐"
     spells = spell_page.get("spells", [])
-    return "+".join(spells) if spells else "闪现+传送"
+    return "+".join(spells) if spells else "暂无推荐"
 
 
 def _winrate_bar(wr, width=10):
@@ -492,6 +501,21 @@ def _winrate_bar(wr, width=10):
 
 if __name__ == "__main__":
     print("LoL BP Assistant — LCU Auto Mode v2.0")
+
+    # Initialize personal stats database and load global stats
+    try:
+        from match_collector import init_db
+        init_db()
+    except Exception as e:
+        print(f"  [WARN] Personal stats DB init failed: {e}")
+
+    # Pre-load global stats into recommender
+    try:
+        from recommender import _load_global_stats
+        _load_global_stats()
+    except Exception:
+        pass
+
     print("等待进入英雄选择...")
     import threading
     t = threading.Thread(

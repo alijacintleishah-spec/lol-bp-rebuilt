@@ -54,47 +54,6 @@ SUMMONER_SPELL_NAMES = {
 }
 
 
-def _default_runes(champion_name: str, role: str) -> list[dict]:
-    """Default rune pages when scraping fails. LoL analytics averages."""
-    defaults = {
-        "top": {"primary": "精密", "keystone": "征服者",
-                "secondary": "坚决", "pick_rate": 45.0, "win_rate": 51.0},
-        "jungle": {"primary": "主宰", "keystone": "黑暗收割",
-                   "secondary": "巫术", "pick_rate": 40.0, "win_rate": 50.5},
-        "mid": {"primary": "主宰", "keystone": "电刑",
-                "secondary": "巫术", "pick_rate": 38.0, "win_rate": 51.2},
-        "bot": {"primary": "精密", "keystone": "致命节奏",
-                "secondary": "主宰", "pick_rate": 50.0, "win_rate": 51.5},
-        "support": {"primary": "坚决", "keystone": "余震",
-                    "secondary": "启迪", "pick_rate": 35.0, "win_rate": 50.8},
-    }
-    page = dict(defaults.get(role, defaults["mid"]))
-    page["champion"] = champion_name
-    page["role"] = role
-    return [page]
-
-
-def _default_spells(champion_name: str, role: str) -> list[dict]:
-    """Default summoner spells when scraping fails."""
-    defaults = {
-        "top": [{"spells": ["闪现", "传送"], "pick_rate": 65.0, "win_rate": 51.0},
-                {"spells": ["闪现", "点燃"], "pick_rate": 30.0, "win_rate": 52.0}],
-        "jungle": [{"spells": ["闪现", "惩戒"], "pick_rate": 98.0, "win_rate": 51.0}],
-        "mid": [{"spells": ["闪现", "点燃"], "pick_rate": 55.0, "win_rate": 51.5},
-                {"spells": ["闪现", "传送"], "pick_rate": 35.0, "win_rate": 50.5}],
-        "bot": [{"spells": ["闪现", "治疗"], "pick_rate": 70.0, "win_rate": 51.5},
-                {"spells": ["闪现", "净化"], "pick_rate": 15.0, "win_rate": 50.0}],
-        "support": [{"spells": ["闪现", "点燃"], "pick_rate": 50.0, "win_rate": 51.0},
-                    {"spells": ["闪现", "虚弱"], "pick_rate": 40.0, "win_rate": 52.0}],
-    }
-    return defaults.get(role, defaults["mid"])
-
-
-def _default_matchups(champion_name: str, role: str) -> dict:
-    """Default matchup data — neutral."""
-    return {}  # Empty = no advantage data → 50% prediction
-
-
 def scrape_champion_page(champion_name: str, role: str = "") -> dict | None:
     """
     Scrape a lolalytics champion page for runes and summoner spells.
@@ -235,8 +194,8 @@ def get_runes(champion_key: int, role: str = "") -> list[dict]:
         except Exception:
             pass
 
-    # 3. Fall back to role-based defaults
-    return _default_runes(name, role)
+    # 3. No data available — caller should handle empty result
+    return []
 
 
 def get_spells(champion_key: int, role: str = "") -> list[dict]:
@@ -287,8 +246,8 @@ def get_spells(champion_key: int, role: str = "") -> list[dict]:
         except Exception:
             pass
 
-    # 3. Fall back to role-based defaults
-    return _default_spells(name, role)
+    # 3. No data available — caller should handle empty result
+    return []
 
 
 def get_matchup(champion_key: int, enemy_key: int, role: str = "") -> dict | None:

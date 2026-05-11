@@ -124,6 +124,43 @@ def _pick_id(pick) -> int:
     return pick
 
 
+def _build_opgg_counter_map(enemy_ids: list[int]) -> dict[int, dict[int, float]]:
+    """Pre-load OP.GG counter data for enemy champions.
+    Returns {enemy_id: {candidate_id: advantage_float}} where advantage > 0 means
+    candidate counters enemy, advantage < 0 means candidate is countered.
+    """
+    result = {}
+    if not enemy_ids:
+        return result
+    try:
+        from meta_fetcher import _load_counters_cache, _fetch_opgg_champion_analysis, _save_counters_cache, COUNTERS_CACHE_HOURS
+        import time
+        cd_local = get_champion_data()
+        for eid in enemy_ids:
+            cached = _load_counters_cache(eid)
+            if cached is None:
+                ename = cd_local.champions.get(eid, {}).get("dd_id", "")
+                erole = cd_local.get_role(eid)
+                raw = _fetch_opgg_champion_analysis(ename, erole) if ename else None
+                if raw:
+                    _save_counters_cache(eid, raw, ename, erole)
+                    cached = _load_counters_cache(eid)
+            if not cached:
+                continue
+            entry = {}
+            # weak_counters: enemy beats these — candidate is countered (negative advantage)
+            for c in cached.get("weak_counters", []):
+                entry[c["champion_id"]] = 50.0 - c.get("win_rate", 50)
+            # strong_counters: enemy loses to these — candidate counters enemy (positive advantage)
+            for c in cached.get("strong_counters", []):
+                entry[c["champion_id"]] = c.get("win_rate", 50) - 50.0
+            if entry:
+                result[eid] = entry
+    except Exception:
+        pass
+    return result
+
+
 def recommend(my_position: str, enemy_ids: list[int] | None = None,
               banned_ids: list[int] | None = None,
               teammate_ids: list[int] | None = None, top_n: int = 12,
@@ -141,6 +178,8 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
 
     used = set(banned_ids) | set(enemy_ids) | set(teammate_ids)
     scored = []
+
+    opgg_counter_map = _build_opgg_counter_map(enemy_ids)
 
     for ckey in cd.all_champions():
         if ckey in used:
@@ -258,6 +297,23 @@ def recommend(my_position: str, enemy_ids: list[int] | None = None,
                         reasons.append(f"对线压{cd.get_name(ek)}(+{gd10:.0f}g)")
                     elif "被克制" in lane_counter:
                         reasons.append(f"对线劣{cd.get_name(ek)}({gd10:.0f}g)")
+
+            # 3c. OP.GG counter stats (win-rate based matchup data)
+            if opgg_counter_map:
+                for ek in enemy_ids:
+                    ek_data = opgg_counter_map.get(ek, {})
+                    if ckey in ek_data:
+                        advantage = ek_data[ckey]
+                        if abs(advantage) >= 2.0:
+                            ek_name = cd.get_name(ek)
+                            if advantage > 0:
+                                bonus = round(min(advantage * 0.8, 15))
+                                counter_score += bonus
+                                reasons.insert(0, f"克制{ek_name}(OP.GG {50+advantage:.0f}%)")
+                            else:
+                                penalty = round(min(-advantage * 0.8, 15))
+                                countered_score += penalty
+                                reasons.append(f"被{ek_name}克制(OP.GG {50+advantage:.0f}%)")
 
         # 4. Synergy
         syn_score, syn_names = cd.get_synergy_score(ckey, teammate_ids)

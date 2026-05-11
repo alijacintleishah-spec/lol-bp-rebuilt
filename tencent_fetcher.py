@@ -316,3 +316,105 @@ def get_champion_spells(hero_id, lane=""):
 
     spell_dict = fetch_spell_dict()
     return parse_spells(lane_data.get("spellidjson", ""), spell_dict)
+
+
+# ── Cached wrappers (used by engine.py) ──
+
+def get_runes(champion_key: int, role: str = "") -> list[dict]:
+    """Get rune pages for a champion in a specific role (cached)."""
+    import json
+    from champion_data import get_champion_data
+    cd = get_champion_data()
+    role = role or cd.get_role(champion_key)
+
+    runes_cache = os.path.join(DATA_DIR, "runes.json")
+
+    # 1. Try Tencent 101 data
+    tc_runes = get_champion_runes(champion_key, role)
+    if tc_runes:
+        result = []
+        for r in tc_runes:
+            primary_tree = r.get("primary", "")
+            secondary_tree = r.get("secondary", "")
+            display = f"{r['keystone']} {primary_tree}"
+            if secondary_tree:
+                display += f"/{secondary_tree}"
+            result.append({
+                "keystone": r["keystone"],
+                "primary": primary_tree,
+                "secondary": secondary_tree,
+                "pick_rate": r.get("pickrate", 0),
+                "win_rate": r.get("winrate", 50.0),
+                "display": display,
+            })
+        os.makedirs(DATA_DIR, exist_ok=True)
+        try:
+            cache = {}
+            if os.path.exists(runes_cache):
+                with open(runes_cache, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            cache[f"{champion_key}_{role}"] = result
+            with open(runes_cache, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+        return result
+
+    # 2. Try local file cache
+    if os.path.exists(runes_cache):
+        try:
+            with open(runes_cache, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            key = f"{champion_key}_{role}"
+            if key in cached:
+                return cached[key]
+        except Exception:
+            pass
+
+    return []
+
+
+def get_spells(champion_key: int, role: str = "") -> list[dict]:
+    """Get summoner spells for a champion in a specific role (cached)."""
+    import json
+    from champion_data import get_champion_data
+    cd = get_champion_data()
+    role = role or cd.get_role(champion_key)
+
+    spells_cache = os.path.join(DATA_DIR, "summoner_spells.json")
+
+    # 1. Try Tencent 101 data
+    tc_spells = get_champion_spells(champion_key, role)
+    if tc_spells:
+        result = []
+        for s in tc_spells:
+            result.append({
+                "spells": s["spells"],
+                "pick_rate": s.get("pickrate", 0),
+                "win_rate": s.get("winrate", 50.0),
+            })
+        os.makedirs(DATA_DIR, exist_ok=True)
+        try:
+            cache = {}
+            if os.path.exists(spells_cache):
+                with open(spells_cache, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            cache[f"{champion_key}_{role}"] = result
+            with open(spells_cache, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+        return result
+
+    # 2. Try local file cache
+    if os.path.exists(spells_cache):
+        try:
+            with open(spells_cache, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            key = f"{champion_key}_{role}"
+            if key in cached:
+                return cached[key]
+        except Exception:
+            pass
+
+    return []

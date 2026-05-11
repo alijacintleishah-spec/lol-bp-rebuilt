@@ -222,7 +222,7 @@ def recommend_runes_spells(our_team: dict[str, int],
     our_team/enemy_team: {lane: champion_id}
     Returns: {f"{side}_{lane}": {"runes": [...], "spells": [...]}}
     """
-    from lolalytics_scraper import get_runes, get_spells
+    from tencent_fetcher import get_runes, get_spells
 
     result = {}
 
@@ -256,8 +256,6 @@ def predict_matchups(our_team: dict[str, int],
       lane_winrate: per-lane matchup predictions
       game_winrate: overall team composition win rate
     """
-    from lolalytics_scraper import get_matchup
-
     FOUR_LANES = ["top", "jungle", "mid", "bottom"]
     lane_predictions = {}
     lane_weighted_sum = 0.0
@@ -284,11 +282,14 @@ def predict_matchups(our_team: dict[str, int],
             ]
             for our, enemy, pos in pairs:
                 if our and enemy:
-                    mu = get_matchup(our, enemy, pos)
-                    if mu:
-                        scores.append(mu.get("wr_delta", 0))
+                    from meta_fetcher import get_opgg_matchup
+                    opgg = get_opgg_matchup(our, enemy, pos)
+                    if opgg and opgg.get("games", 0) >= 50:
+                        scores.append(opgg.get("advantage", 0))
                     else:
-                        scores.append(0)  # 无数据，中性贡献
+                        c_score, _ = cd.get_counter_score(our, [enemy])
+                        cd_score, _ = cd.get_countered_score(our, [enemy])
+                        scores.append((c_score - cd_score) * 0.6)
                 else:
                     scores.append(0)
 
@@ -318,7 +319,7 @@ def predict_matchups(our_team: dict[str, int],
                                            "our_heroes": our_heroes, "enemy_heroes": enemy_heroes}
                 continue
 
-            # Three-tier data source: personal >=5 > lolalytics > neutral
+            # Three-tier data source: personal stats > OP.GG > built-in matrix
             pers = _get_matchup_from_stats(our_hero, enemy_hero, lane)
             if pers:
                 wr_delta = (pers["win_rate"] - 50.0) * 2
@@ -326,12 +327,15 @@ def predict_matchups(our_team: dict[str, int],
                 gd10 = pers.get("avg_gold_diff_10", 0)
                 our_wr += max(-3.0, min(3.0, gd10 / 200))
             else:
-                matchup = get_matchup(our_hero, enemy_hero, lane)
-                if matchup:
-                    wr_delta = matchup.get("wr_delta", 0)
-                    our_wr = 50.0 + wr_delta / 2
+                from meta_fetcher import get_opgg_matchup
+                opgg = get_opgg_matchup(our_hero, enemy_hero, lane)
+                if opgg and opgg.get("games", 0) >= 50:
+                    advantage = opgg.get("advantage", 0)
+                    our_wr = 50.0 + advantage / 2
                 else:
-                    our_wr = 50.0
+                    c_score, _ = cd.get_counter_score(our_hero, [enemy_hero])
+                    cd_score, _ = cd.get_countered_score(our_hero, [enemy_hero])
+                    our_wr = 50.0 + (c_score - cd_score) * 0.3
 
             our_heroes = [cd.get_name(our_hero)]
             enemy_heroes = [cd.get_name(enemy_hero)]

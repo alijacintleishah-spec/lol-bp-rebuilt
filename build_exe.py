@@ -24,7 +24,7 @@ PyInstaller.__main__.run([
     '--hidden-import=lcu',
     '--hidden-import=meta_fetcher',
     '--hidden-import=lane_detector',
-    '--hidden-import=lolalytics_scraper',
+
     '--hidden-import=psutil',
     '--hidden-import=requests',
     '--hidden-import=websocket',
